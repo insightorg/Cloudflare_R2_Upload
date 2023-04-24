@@ -7,12 +7,18 @@ import {
 } from '@aws-sdk/client-s3'
 import fs  from 'fs'
 import md5 from 'md5'
+import axios from 'axios'
+import crypto from "crypto"
+import path from 'path'
 
 import {
     cloudflareAccountId,
     cloudflareR2AccessKeyId,
     cloudflareR2SecretAccessKey,
-    cloudflareR2BucketName
+    cloudflareR2BucketName,
+    cloudflarePurgeZoneId,
+    cloudflareEmail,
+    cloudflareApiKey
 } from './config.js'
 
 const S3 = new S3Client({
@@ -23,18 +29,6 @@ const S3 = new S3Client({
         secretAccessKey: cloudflareR2SecretAccessKey,
     },
 });
-
-/*console.log(
-    await S3.send(
-        new ListBucketsCommand('')
-    )
-);
-
-console.log(
-    await S3.send(
-        new ListObjectsV2Command({ Bucket: cloudflareR2BucketName })
-    )
-);*/
 
 const getFileList = (dirName) => {
     let files = [];
@@ -53,38 +47,77 @@ const getFileList = (dirName) => {
 
 const files: string[] = getFileList('uploads');
 
+const revision = fs.readFileSync("revision.txt").toString().split("\n")[0].trim();
+
+const revisionFolderPath = path.join(process.cwd(), `revisions/${revision}`);
+if (!fs.existsSync(revisionFolderPath)) {
+    fs.mkdirSync(revisionFolderPath, { recursive: true });
+}
+
+let total = 0;
+
 try {
     for (const file of files) {
-        const fileStream = fs.readFileSync(file);
+        const fileStream = fs.createReadStream(file);
         const fileName = file.replace(/uploads\//g, '');
 
         if (fileName.includes('.gitkeep'))
             continue;
 
-        console.log(fileName)
+        const hash = crypto.createHash('md5');
 
-        const uploadParams: PutObjectCommandInput = {
-            Bucket: cloudflareR2BucketName,
-            Key: fileName,
-            Body: fileStream,
-            ContentLength: fs.statSync(file).size,
-            ContentType: 'application/octet-stream'
-        };
+        fileStream.on('data', function(chunk) {
+            hash.update(chunk);
+        });
+        
+        fileStream.on('end', async function() {
+            const digest = hash.digest('hex');
+        
+            const uploadParams = {
+                Bucket: cloudflareR2BucketName,
+                Key: fileName,
+                Body: fs.createReadStream(file),
+                ContentLength: fs.statSync(file).size,
+                ContentType: 'application/octet-stream',
+            };
+        
+            const cmd = new PutObjectCommand(uploadParams);
+        
+            cmd.middlewareStack.add((next) => async (args: any) => {
+                args.request.headers['if-none-match'] = `"${digest}"`;
+                return await next(args);
+            }, {
+                step: 'build',
+                name: 'addETag'
+            })
+    
+            const data = await S3.send(cmd);
 
-        const cmd = new PutObjectCommand(uploadParams);
+            // Move file to revision folder
+            const destFilePath = path.join(revisionFolderPath, fileName);
+            fs.mkdirSync(path.dirname(destFilePath), { recursive: true });
+            fs.renameSync(file, destFilePath);
 
-        const digest = md5(fileStream);
+            console.log(`Success ${fileName} - Status Code: ${data.$metadata.httpStatusCode}`);
 
-        cmd.middlewareStack.add((next) => async (args: any) => {
-            args.request.headers['if-none-match'] = `"${digest}"`;
-            return await next(args);
-        }, {
-            step: 'build',
-            name: 'addETag'
-        })
+            total++;
 
-        const data = await S3.send(cmd);
-        console.log(`Success - Status Code: ${data.$metadata.httpStatusCode}`);
+            if (total === files.length) {
+                // axios.post("https://api.cloudflare.com/client/v4/zones/{ZONE_ID}/purge_cache".replace('{ZONE_ID}', cloudflarePurgeZoneId), {
+                //     files: files.map((f) => `https://patcher.fallendesert.com/${f.replace("uploads/", "")}`)
+                // }, {
+                //     headers: {
+                //         'X-Auth-Email': cloudflareEmail,
+                //         'X-Auth-Key': cloudflareApiKey,
+                //         'Content-Type': 'application/json'
+                //     }
+                // }).then(response => {
+                //     console.log(response.data);
+                // }).catch(error => {
+                //     console.error(error);
+                // });
+            }
+        });
     }
 } catch (err) {
     if (err.hasOwnProperty('$metadata')) {
